@@ -1,0 +1,55 @@
+<?xml version="1.0" ?>
+<robot name="L515_camera_with_stand">
+  <link name="vertical_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+       <mass value="2.5"/>
+       <inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/>
+    </inertial>
+    <visual>
+      <geometry>
+        <box size="0.01 0.01 0.8"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <link name="horizontal_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+       <mass value="2.5"/>
+       <inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/>
+    </inertial>
+    <visual>
+      <geometry>
+        <box size="0.1 0.01 0.01"/>
+      </geometry>
+    </visual>
+  </link>
+
+<link name="camera_link">
+ <inertial>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+       <mass value="0.4"/>
+       <inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/>
+    </inertial>
+   <visual>
+    <geometry>
+      <mesh filename="l515.dae"/>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+    </geometry>
+   </visual>
+   </link>
+
+<joint name="vertical_to_horizontal" type="fixed">
+    <parent link="vertical_link"/>
+    <child link="horizontal_link"/>
+    <origin xyz="-0.045 0 0.405"/>
+  </joint>
+
+<joint name="camera_joint" type="fixed">
+    <parent link="horizontal_link"/>
+    <child link="camera_link"/>
+    <origin rpy="3.1416 0.5236 0" xyz="-0.05 0 -0.014"/>
+  </joint>
+#originally 0.7854 
+</robot>
