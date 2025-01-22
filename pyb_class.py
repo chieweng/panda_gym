@@ -474,7 +474,8 @@ class PyBullet:
                 value. Defaults to None.
             texture (str or None, optional): Texture file name. Defaults to None.
         """
-        rgba_color = rgba_color if rgba_color is not None else np.zeros(4)
+        rgba_color = rgba_color if rgba_color is not None else np.array([0.95, 0.95, 0.95, 1.0]),
+
         specular_color = specular_color if specular_color is not None else np.zeros(3)
         visual_kwargs = {
             "halfExtents": half_extents,

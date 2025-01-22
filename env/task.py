@@ -10,8 +10,15 @@ from env.franka_env import FrankaPandaCam, Scene
 from utils.camera_utils import *
 from utils.pcd_utils import *
 
+import logging
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 
-class MultiScanTask:
+class Task:
+    """ Base class for robot tasks. """
+    def __init__(self, robot):
+        self.robot = robot
+
+class MultiScanTask(Task):
     """
     A class to perform multiple scans using the Franka Panda robot with a Realsense D405 camera.
 
@@ -49,14 +56,18 @@ class MultiScanTask:
             point_to_cog (bool): If True, orient the end-effector towards the object's base position.
             scene (Scene): The simulation scene containing the object.
         """
+        
+        object_base_pos, object_center_height = scene.object_pos, scene.object_size[2]/2 # Get default object base position and object CoG height from scene
+        object_center = object_base_pos + [0, 0, object_center_height]
 
         for i, scan_pos in enumerate(self.scan_positions):
-            print(f"Moving to scan position {i + 1} / {len(self.scan_positions)}: {scan_pos}")
+            logging.info("-----------------------------------------------------------------------")
+            logging.info(f"Moving to scan position {i+1} / {len(self.scan_positions)}: {scan_pos}")
 
             # Calculate the quaternion to point towards the CoG if point_to_cog == True
             if point_to_cog:
-                object_base_pos = scene.object_pos # Get default object base position from scene
-                cam_ori_quat = self.calculate_orientation(scan_pos, object_base_pos, output_type="quaternion")
+                cam_ori_quat = self.calculate_orientation(scan_pos, object_center, output_type="quaternion") # Lookat object 
+                
             else:
                 cam_ori_quat = [0, 0, 0, 1]  # Identity quaternion (no rotation)
 
@@ -71,31 +82,37 @@ class MultiScanTask:
             self.robot.visualize_camera_pose()
 
             # Capture RGB and depth images from the camera
-            rgb_img, depth_img, intrinsics = self.robot.render_from_robot_cam()
+            rgb_img, depth_img, intrinsics = render_from_robot_cam(robot=self.robot)
 
-            self._save_images(i, rgb_img)
+            self._save_images(i+1, rgb_img)
             
             # Compute intrinsic and extrinsic camera parameters
-            cam_pos = scene.robot.get_link_position(scene.robot.cam_link)
-            cam_ori_R = self.calculate_orientation(scan_pos, object_base_pos, output_type="rotation_matrix")
-            Rx, Ry, Rz = cam_ori_R[:, 0], cam_ori_R[:, 1], cam_ori_R[:, 2]
-            extrinsics = compute_extrinsics_matrix(Rx, Ry, Rz, cam_pos)
+            cam_pos = scene.robot.get_link_position(scene.robot.cam_render_link)
+            cam_ori_R = self.calculate_orientation(cam_pos, object_center, output_type="rotation_matrix")
+            extrinsics = compute_extrinsics_matrix(cam_ori_R, cam_pos)
             
-            # Convert depth image to point cloud
-            point_cloud = depth_image_to_point_cloud(depth_img, intrinsics, extrinsics)
-            np.save(os.path.join(self.output_dir, f"point_cloud_{i:03d}.npy"), point_cloud)
-            print(f"Point cloud saved for scan {i}.")
+            # print("cam_pos", cam_pos)
+            # print("cam_ori", cam_ori_R)
+            # print("extrinsics", extrinsics)
+            
+            # Convert depth image to point cloud in world frame
+            point_cloud = depth_image_to_point_cloud(depth_img, intrinsics, extrinsics, object_center, cam_ori_R)
+            
+            np.save(os.path.join(self.output_dir, f"point_cloud_{i+1:03d}.npy"), point_cloud)
+            logging.info(f"Point Cloud saved for scan {i+1}.")
             
             # plot_point_cloud(file_name=f"point_cloud_{i:03d}.npy")
+            
+            scene.robot.set_joint_neutral() 
 
     def calculate_orientation(
         self,
         position: np.ndarray,
         target: np.ndarray,
-        output_type: str = 'quaternion'  # New parameter to specify the output type
+        output_type: str = 'quaternion'
     ) -> Union[np.ndarray, Tuple[np.ndarray]]:
         """
-        Calculate the quaternion that orients the camera towards the object's CoG.
+        Calculate the quaternion that orients the camera towards the object's CoG, given the camera position.
             
         Args:
             position (np.ndarray): The current position of the camera.
@@ -151,20 +168,20 @@ class MultiScanTask:
 
         # Save the RGB image as PNG
         plt.imsave(rgb_path, rgb_img)
-        print(f"RGB image saved at: {rgb_path}")
+        logging.info(f"RGB image saved at: {rgb_path}")
 
         # Save the depth image as a NumPy array if provided
         if depth_img is not None:
             np.save(depth_path, depth_img)
-            print(f"Depth image saved at: {depth_path}")
+            logging.info(f"Depth image saved at: {depth_path}")
 
     def reset_robot(self) -> None:
         """Reset the robot to its neutral position after the scanning process is complete."""
-        print("Resetting the robot to its neutral position...")
+        logging.info("Resetting the robot to its neutral position...")
         self.robot.reset()
 
     def close(self) -> None:
         """Close the robot simulation after completing the scanning task."""
-        print("Closing the robot simulation...")
+        logging.info("Closing the robot simulation...")
         self.robot.close()
 

@@ -1,8 +1,12 @@
 from typing import List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
 import os
 import numpy as np
 import open3d as o3d
 import copy
+
+import logging
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 
 class PointCloudMerger:
     """
@@ -16,7 +20,7 @@ class PointCloudMerger:
         self,
         scene_instance,
         voxel_size: float = 0.01,
-        max_correspondence_dist: float = 0.05,
+        max_correspondence_dist: float = 0.01,
         rolling_ball_radius: float = 0.1,
         smoothing_iter: int = 10,
         generate_mesh: bool = False
@@ -25,14 +29,12 @@ class PointCloudMerger:
         Initialize parameters for point cloud merging and processing.f
 
         Args:
-            ----- Global Registration -----
+            ----- Global Registration/ICP -----
             voxel_size (float): Size of voxel grid used for downsampling. 
                 Recommended range:
-                - High-density point clouds (millions of points): ~1% to 5% of the average point spacing.
+                - High-density point clouds: ~1% to 5% of the average point spacing.
                 - Medium-density point clouds: ~0.02 to 0.05 times the point spacing.
                 - Low-density point clouds: ~0.1 to 0.2 times the point spacing.
-                
-            ----- Local Registration (ICP) -----
             max_correspondence_dist (float): Maximum distance for ICP point correspondence.
             
             ----- Mesh generation -----
@@ -51,20 +53,14 @@ class PointCloudMerger:
         self.source_down_list: List[o3d.geometry.PointCloud] = [] # List of downsampled source pcd with normal
         self.source_fpfh_list: List[o3d.registration.Feature] = [] # List of FPFH descriptor (N, 33) for each pcd, where N = num of points in pcd, 33 = num of bins of the histogram in standard configuration
         self.target_pcd = o3d.geometry.PointCloud() # Initialize empty o3d for final pcd output
-        
-    def pcd_preprocessing(self):
-        """
-        1. Load and convert point_cloud.npy files to Open3D format.
-        2. Downsample each point cloud with a specified voxel size.
-        3. Estimate normals and compute the Fast Point Feature Histograms (FPFH) features.
-        """
-        
-        def downsample_to_target(pcd, target_min=1000, target_max=3000, max_iter=50):
+    
+    def downsample_and_compute_fpfh(self, pcd):
+        def downsample_to_target(pcd, target_min=2500, target_max=3500, max_iter=50):
             """
             Downsample the point cloud to a size within the target range [target_min, target_max].
             """
             voxel_size = self.voxel_size
-            downsampled_pcd = pcd.voxel_down_sample(voxel_size)
+            downsampled_pcd = pcd.voxel_down_sample(self.voxel_size)
             
             # Iteratively adjust the voxel size based on the downsampled size
             for i in range(max_iter):
@@ -84,63 +80,68 @@ class PointCloudMerger:
             
             return downsampled_pcd
         
+        pcd_down = downsample_to_target(pcd)
+
+        # Estimate normals for downsampled pcd
+        radius_normal = self.voxel_size * 2
+        pcd_down.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius = radius_normal, max_nn = 30)
+            )
+        
+        # Compute FPFH, which captures local geom properties of each point based on distribution of angles between the point's normal and neighbors' normals.
+        radius_feature = self.voxel_size * 2
+        fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+            pcd_down, 
+            o3d.geometry.KDTreeSearchParamHybrid(radius = radius_feature, max_nn = 175)
+            )
+        return pcd_down, fpfh
+
+    def pcd_preprocessing(self):    
         files = [f for f in os.listdir(self.npy_file_path) if f.endswith('.npy')] # List all npy files in dir
         if not files: raise ValueError("No .npy files found in the specified directory.")
         
         npy_data_list = [np.load(os.path.join(self.npy_file_path, file)) for file in files] # Load each npy file into list
 
         # Convert numpy arrays to Open3D point clouds
-        for data in npy_data_list:
+        for i, data in enumerate(npy_data_list):
+            print("-----------------------------------------------------------------------")
+            print(f"Performing post-processing sequence on Point Cloud {i+1}")
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(data) # Convert numpy arrays to o3d-compatible format
-            self.visualize(point_cloud=pcd)
             
-            # Segment and remove background (table, clipping plane)
-            points = np.asarray(pcd.points)
+            # self.visualize(point_cloud=pcd)
             
-            ###
-            import pybullet as p
-            import random
-            # Randomly sample 100 points from the point cloud
-            sampled_points = random.sample(points.tolist(), 10)
-
-            for point in sampled_points:
-                x, y, z = point
-                p.addUserDebugLine(lineFromXYZ=[x, y, z], lineToXYZ=[x, y, z], lineColorRGB=[1, 0, 0], lineWidth=5)
-            ###
-                    
-            print("Number of points before masking:", points.shape[0])
+            # with open("points_output.txt", 'w') as f:
+            #     for point in pcd.points:
+            #         # Write each point as a line of space-separated x, y, z coordinates
+            #         f.write(f"{point[0]} {point[1]} {point[2]}\n")
             
-            #TODO since bounding box is axis aligned and doesnt account for rotations, when camera captures pcd from various angles, the bounding box will not be able to correctly segment the noise, try transforming all pcd data to local frame firsts
+            # Remove background point cloud (table, clipping plane)                        
+            bb_min = self.scene_instance.obb_min - np.array([0.3, 0.3, 0.3]) #increase size of bb
+            bb_max = self.scene_instance.obb_max + np.array([0.3, 0.3, 0.3])
+            aabb = o3d.geometry.AxisAlignedBoundingBox(min_bound = bb_min, max_bound = bb_max)
             
-            obb_min = self.scene_instance.obb_min
-            obb_max = self.scene_instance.obb_max
-            mask = np.all((points >= obb_min) & (points <= obb_max), axis=1)
-            print("Mask:", mask)
-            segmented_pcd = pcd.select_by_index(np.where(mask)[0])
-                                
-            self.visualize(point_cloud = segmented_pcd)
+            pcd_masked = pcd.crop(aabb, invert = False)
+            # self.visualize(point_cloud = pcd_masked)
             
-            pcd_down = downsample_to_target(segmented_pcd)
-            print("Downsampled point cloud size:", len(pcd_down.points))
-                        
-            # Estimate normals for downsampled pcd
-            radius_normal = self.voxel_size * 2
-            pcd_down.estimate_normals(
-                o3d.geometry.KDTreeSearchParamHybrid(radius = radius_normal, max_nn = 30)
-                )
+            # Segment the largest plane
+            _, inliers = pcd_masked.segment_plane(distance_threshold=0.005,  # Adjust based on your data scale
+                                                            ransac_n=3,
+                                                            num_iterations=1000)
             
-            # # Compute FPFH, which captures local geom properties of each point based on distribution of angles between the point's normal and neighbors' normals.
-            # radius_feature = self.voxel_size * 5
-            # pcd_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-            #     pcd_down, 
-            #     o3d.geometry.KDTreeSearchParamHybrid(radius = radius_feature, max_nn = 100)
-            #     )
+            pcd_masked = pcd_masked.select_by_index(inliers, invert=True)
+            
+            # pcd_down = pcd_down.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)[0]
+            
+            pcd_down, fpfh = self.downsample_and_compute_fpfh(pcd_masked)
+            
+            logging.info(f"Masked point cloud size: {len(pcd_masked.points)}")
+            logging.info(f"Downsampled point cloud size: {len(pcd_down.points)}")
             
             # Populate
-            self.source_pcd_list.append(pcd)
+            self.source_pcd_list.append(pcd_masked)
             self.source_down_list.append(pcd_down)
-            # self.source_fpfh_list.append(pcd_fpfh)
+            self.source_fpfh_list.append(fpfh)
             
         self.target_pcd = self.source_pcd_list[0]
     
@@ -166,19 +167,22 @@ class PointCloudMerger:
                 from the limited normal information.
                 2) Computational efficiency for rough transformation using global registration, ICP for refined alignments.
         """
+        
         result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
             source_down, target_down, source_fpfh, target_fpfh, 
-            mutual_filter = True,
+            mutual_filter = False,
             max_correspondence_distance = self.max_correspondence_dist,
             estimation_method = o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
             ransac_n = 3, 
-            checkers = [o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+            checkers = [o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.95),
                         o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(self.max_correspondence_dist)], 
-            criteria = o3d.pipelines.registration.RANSACConvergenceCriteria(400000, 500))
+            criteria = o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 20000))
+        
+        logging.info(f"RANSAC result: fitness = {result.fitness}, inlier_rmse = {result.inlier_rmse}")
         
         return result.transformation    
     
-    def point_to_plane_icp(self, source_pcd, target_pcd, trans_matrix):
+    def point_to_plane_icp(self, source_pcd, target_pcd, transformation_matrix_RANSAC):
         """
         Refines the alignment of source and target pcd using the Point-to-Plane Iterative Closest Point (ICP) algorithm.
     
@@ -188,7 +192,7 @@ class PointCloudMerger:
         Args:
             source_pcd (open3d.geometry.PointCloud): The source point cloud to be aligned.
             target_pcd (open3d.geometry.PointCloud): The target point cloud to align the source point cloud against.
-            trans_matrix (numpy.ndarray): A 4x4 transformation matrix providing an initial rough alignment.
+            transformation_matrix_RANSAC (numpy.ndarray): A 4x4 transformation matrix providing an initial rough alignment, obtained from RANSAC.
 
         Returns:
             numpy.ndarray: A refined 4x4 transformation matrix that aligns the source point cloud to the target point cloud.
@@ -197,62 +201,81 @@ class PointCloudMerger:
             source_pcd,
             target_pcd,
             self.max_correspondence_dist, 
-            trans_matrix,
+            transformation_matrix_RANSAC,
             o3d.pipelines.registration.TransformationEstimationPointToPlane())
-
-        return result.transformation
         
-    def merge_point_clouds(self) -> Tuple[o3d.geometry.PointCloud, o3d.geometry.TriangleMesh]:
-        """
-        Perform point cloud alignment process, then apply optional surface reconstruction and smoothing for mesh generation.
-
-        Returns:
-            o3d.geometry.PointCloud: Merged point cloud.
-            o3d.geometry.TriangleMesh: Smoothed mesh (from surface reconstruction).
-        """
-
-        # Align each point cloud to the target using ICP
-        for i in range(1, len(self.source_pcd_list)):
-            target_pcd = self.target_pcd # First point cloud entry as the target/reference
-            target_pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius = self.voxel_size * 2, max_nn = 30)) # Only precomputed normals for target pcd are required for Point-to-plane ICP
-            target_down = target_pcd.voxel_down_sample(self.voxel_size)
-            target_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius = self.voxel_size * 2, max_nn = 30)) # Recalculate normals after voxel downsampling
-            target_fpfh = o3d.pipelines.registration.compute_fpfh_feature(target_down, o3d.geometry.KDTreeSearchParamHybrid(radius = self.voxel_size * 5, max_nn = 100))
-
-            source_pcd = self.source_pcd_list[i]
-            source_down = self.source_down_list[i]
-            source_fpfh = self.source_fpfh_list[i]
+        logging.info(f"ICP result: fitness = {result.fitness}, inlier_rmse = {result.inlier_rmse}")
+        
+        return result.transformation
+    
+    
+    def hierarchical_registration(self, pcd_list):
+                
+        def pairwise_merge(source_pcd, target_pcd):
+            # logging.info("Starting pairwise merge")
+            source_down, source_fpfh = self.downsample_and_compute_fpfh(source_pcd)
+            target_down, target_fpfh = self.downsample_and_compute_fpfh(target_pcd)
             
-            # RANSAC to obtain rough transformation matrix
+            # Global registration
             transformation_matrix_RANSAC = self.global_registration(source_down, target_down, source_fpfh, target_fpfh)
-            
-            # ICP for alignment
+            # logging.info("Global registration completed")
+
+            # Point to plane ICP
+            radius_normal = self.voxel_size * 2
+            source_pcd.estimate_normals(
+                o3d.geometry.KDTreeSearchParamHybrid(radius = radius_normal, max_nn = 30)
+                )
+            target_pcd.estimate_normals(
+                o3d.geometry.KDTreeSearchParamHybrid(radius = radius_normal, max_nn = 30)
+                )
             transformation_matrix_ICP = self.point_to_plane_icp(source_pcd, target_pcd, transformation_matrix_RANSAC)
-            
+            # logging.info("ICP registration completed")
+
             # Transform and merge source cloud
             source_pcd.transform(transformation_matrix_ICP)
+            target_pcd += source_pcd        
+            target_pcd.remove_duplicated_points()
+            # logging.info("Pairwise merge completed")
             
-            self.draw_registration_result(source_pcd, target_pcd, transformation_matrix_ICP)
-            
-            self.target_pcd += source_pcd          
-            self.target_pcd.remove_duplicated_points()
-            
-        self.visualize(self.target_pcd)
+            return target_pcd
         
-        mesh = None
-        if self.generate_mesh: 
-            # Surface reconstruction via rolling ball algorithm approximation
-            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
-                self.target_pcd,
-                o3d.utility.DoubleVector([self.rolling_ball_radius, self.rolling_ball_radius * 2])
-            )
+        current_layer = pcd_list
+        logging.info("Starting hierarchical registration")
 
-            # Laplacian smoothing on the mesh
-            for _ in range(self.smoothing_iter):
-                mesh = mesh.filter_smooth_laplacian()
-
-        return self.target_pcd, mesh
-
+        layer = 1
+        while len(current_layer) > 1:
+            next_layer = []
+            
+            with ThreadPoolExecutor() as exe:
+                # Pairwise merge point clouds at the current level
+                futures = [
+                    exe.submit(pairwise_merge, current_layer[i], current_layer[i + 1])
+                    for i in range(0, len(current_layer) - 1, 2)
+                ]
+                for future in futures:
+                    next_layer.append(future.result())
+            
+            # for i in range(0, len(current_layer) - 1, 2):
+            #     merged_pcd = pairwise_merge(current_layer[i], current_layer[i + 1])
+            #     next_layer.append(merged_pcd)
+            
+            # If there's an odd number of point clouds, carry the last one to the next level
+            if len(current_layer) % 2 == 1:
+                next_layer.append(current_layer[-1])
+                                        
+            current_layer = next_layer
+            logging.info(f"Completed layer {layer}, {len(current_layer)} point clouds remaining")
+            
+            layer += 1
+                
+        merged_pcd = current_layer[0]
+        logging.info("Hierarchical registration completed")
+        
+        self.visualize(merged_pcd)
+        
+        return merged_pcd
+    
+    
     def save_results(self, point_cloud: Optional[o3d.geometry.PointCloud], mesh: Optional[o3d.geometry.TriangleMesh]):
         """
         Save the merged point cloud and mesh to files.
@@ -270,30 +293,30 @@ class PointCloudMerger:
         
         if point_cloud is not None: 
             o3d.io.write_point_cloud(filename = pcd_filename, pointcloud = point_cloud) 
-            print(f"Point cloud saved to: {pcd_filename}")
+            logging.info(f"Point cloud saved to: {pcd_filename}")
         if mesh is not None: 
             o3d.io.write_triangle_mesh(filename = mesh_filename, mesh = mesh) 
-            print(f"Mesh saved to: {mesh_filename}")
+            logging.info(f"Mesh saved to: {mesh_filename}")
 
-    def draw_registration_result(self, source, target, transform_matrix):
+    def draw_registration_result(self, source_pcd, target_pcd, transformation_matrix):
         """
         Visualizes the target and transformed source point clouds after applying an alignment transformation. Red: source pcd, Cyan: target pcd
         
         Args:
-            source (open3d.geometry.PointCloud): The source pcd to be transformed.
-            target (open3d.geometry.PointCloud): The target pcd.
+            source_pcd (open3d.geometry.PointCloud): The source pcd to be transformed.
+            target_pcd (open3d.geometry.PointCloud): The target pcd.
             transform_matrix (numpy.ndarray or open3d.geometry.Transform): A 4x4 transformation matrix to align the source pcd with target pcd.
         """
-        source_temp = copy.deepcopy(source)
-        target_temp = copy.deepcopy(target)
+        # Transform and merge source cloud
+        source_temp = copy.deepcopy(source_pcd)        
+        source_temp.transform(transformation_matrix)
+        
+        target_temp = copy.deepcopy(target_pcd)
+        
         source_temp.paint_uniform_color([1, 0, 0])
         target_temp.paint_uniform_color([0, 1, 1])
-        source_temp.transform(transform_matrix)
-        o3d.visualization.draw_geometries([source_temp, target_temp], 
-                                          zoom=0.4459, 
-                                          front=[0.9288, -0.2951, -0.2242], 
-                                          lookat=[1.6784, 2.0612, 1.4451], 
-                                          up=[-0.3402, -0.9189, -0.1996])
+        
+        o3d.visualization.draw_geometries([source_temp, target_temp])
         
     def visualize(self, point_cloud = None, mesh = None):
         """

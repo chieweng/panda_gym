@@ -10,7 +10,6 @@ from scipy.spatial.transform import Rotation as R
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import pybullet
 from pyb_class import PyBullet as p
-from utils import math_utils
 
 class FrankaPandaCam:
     """Panda robot in PyBullet with Realsense D405 camera.
@@ -285,7 +284,6 @@ class FrankaPandaCam:
         # Execute the movement based on the mode
         if mode == "static":
             self.set_joint_angles(angles = target_joint_angles)
-            print("cam_pos from robot:", self.get_link_position(13))
 
         elif mode == "dynamic":
             self.control_joints(
@@ -352,6 +350,57 @@ class FrankaPandaCam:
             raise ValueError("Inverse Kinematics failed to find a solution.")
 
         return inverse_kinematics
+    
+    # def render_from_robot_cam(
+    #     self,
+    #     img_width: int = 512,
+    #     img_height: int = 512,
+    #     fov: float = 58, # FOV in degrees
+    # ) -> Tuple[np.ndarray, np.ndarray]:
+    #     """
+    #     Render images from D405 Camera fixed to the panda robot arm
+    #     """
+    #     cam_pos = self.sim.get_link_position("panda_cam", self.cam_render_link) # Eye position
+    #     cam_rot = self.sim.get_link_orientation("panda_cam", self.cam_render_link) # In quaternion
+        
+    #     # Compute rotation matrix to transform in world coordinates
+    #     rot_matrix = np.array(self.sim.physics_client.getMatrixFromQuaternion(cam_rot)).reshape(3,3) # 3x3 rotation matrix (right, forward, up by columns)
+    #     forward_vec = rot_matrix.dot(np.array((0, 0, -1))) # (0, 0, -1) is the default forward direction in camera frame, look-at direction
+    #     up_vec = rot_matrix.dot(np.array((0, 1, 0))) # (0, 1, 0) is the default up direction in camera frame, up direction
+        
+    #     target_position = cam_pos + 0.1 * forward_vec # Target 0.1 units in front of camera
+        
+    #     pybullet.configureDebugVisualizer(pybullet.COV_ENABLE_GUI, 1)
+        
+    #     # Compute view and projection matrices
+    #     view_matrix = self.sim.physics_client.computeViewMatrix(cam_pos, target_position, up_vec) # Transform the world coord into camera coord space
+    #     aspect_ratio = img_width / img_height
+    #     nearVal, farVal = 0.01, 1.5 # Near, far clipping plane
+    #     proj_matrix = self.sim.physics_client.computeProjectionMatrixFOV(fov, aspect_ratio, nearVal, farVal) # Transforms 3D points from camera coord space into 2D screen space
+        
+    #     # Get RBG and depth images from camera
+    #     images = self.sim.physics_client.getCameraImage(
+    #         img_width, 
+    #         img_height, 
+    #         view_matrix, 
+    #         proj_matrix, 
+    #         renderer = pybullet.ER_BULLET_HARDWARE_OPENGL
+    #         )
+        
+    #     rgb_img = np.array(images[2]).reshape((img_height, img_width, 4))[:, :, :3]
+        
+    #     depth_img = np.array(images[3]).reshape((img_height, img_width))        
+
+    #     # Normalize deapth values
+    #     """
+    #     The depth data from the simulation is captured in a non-linear way (as a depth buffer). 
+    #     This needs to be converted into actual depth values using the camera's near and far clipping planes.
+    #     """
+    #     depth_img = (-farVal * nearVal / (farVal - (farVal - nearVal) * depth_img)) # Convert raw depth buffer values (non-linear, scaled between 0-1) into linear depth values
+        
+    #     intrinsics = compute_intrinsics_matrix(img_width, img_height, fov)
+
+    #     return rgb_img, depth_img, intrinsics
         
     def hold_position(self, hold_duration: float, step_interval: float = 0.01) -> None:
         """Hold the robot in its current position for a specified duration.
@@ -370,73 +419,10 @@ class FrankaPandaCam:
             self.control_joints(current_angles, self.joint_forces)  # Maintain position
             self.step()  # Advance the simulation
             time.sleep(step_interval)  # Wait for a short time
-        
-    def render_from_robot_cam(
-        self,
-        cam_width: int = 512,
-        cam_height: int = 512,
-        fov: float = 58, # FOV in degrees
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Render images from D405 Camera fixed to the panda robot arm
-        """
-        def compute_intrinsics(cam_width: int, cam_height: int, fov: float) -> np.ndarray:
-            """Compute the intrinsic camera matrix."""
-            fx = fy = cam_width / (2 * np.tan(np.radians(fov) / 2))  # Focal lengths
-            cx = cam_width / 2  # Principal point x-coordinate
-            cy = cam_height / 2  # Principal point y-coordinate
-
-            # Construct the intrinsic matrix
-            intrinsics = np.array([[fx, 0, cx],
-                                    [0, fy, cy],
-                                    [0,  0,  1]])
-            return intrinsics
-        
-        cam_pos = self.sim.get_link_position("panda_cam", self.cam_render_link) # Eye position
-        cam_rot = self.sim.get_link_orientation("panda_cam", self.cam_render_link) # In quaternion
-        
-        # Compute rotation matrix to transform in world coordinates
-        rot_matrix = np.array(self.sim.physics_client.getMatrixFromQuaternion(cam_rot)).reshape(3,3) # 3x3 rotation matrix (right, forward, up by columns)
-        forward_vec = rot_matrix.dot(np.array((0, 0, -1))) # (0, 0, -1) is the default forward direction in camera frame, look-at direction
-        up_vec = rot_matrix.dot(np.array((0, 1, 0))) # (0, 1, 0) is the default up direction in camera frame, up direction
-        
-        target_position = cam_pos + 0.1 * forward_vec # Target 0.1 units in front of camera
-        
-        pybullet.configureDebugVisualizer(pybullet.COV_ENABLE_GUI, 1)
-        
-        # Compute view and projection matrices
-        view_matrix = self.sim.physics_client.computeViewMatrix(cam_pos, target_position, up_vec) # Transform the world coord into camera coord space
-        aspect_ratio = cam_width / cam_height
-        nearVal, farVal = 0.01, 1.5 # Near, far clipping plane
-        proj_matrix = self.sim.physics_client.computeProjectionMatrixFOV(fov, aspect_ratio, nearVal, farVal) # Transforms 3D points from camera coord space into 2D screen space
-        
-        # Get RBG and depth images from camera
-        images = self.sim.physics_client.getCameraImage(
-            cam_width, 
-            cam_height, 
-            view_matrix, 
-            proj_matrix, 
-            renderer = pybullet.ER_BULLET_HARDWARE_OPENGL
-            )
-        
-        rgb_img = np.array(images[2]).reshape((cam_height, cam_width, 4))[:, :, :3]
-        
-        depth_img = np.array(images[3]).reshape((cam_height, cam_width))        
-
-        # Normalize deapth values
-        """
-        The depth data from the simulation is captured in a non-linear way (as a depth buffer). 
-        This needs to be converted into actual depth values using the camera's near and far clipping planes.
-        """
-        depth_img = farVal * nearVal / (farVal - (farVal - nearVal) * depth_img) # Convert raw depth buffer values (non-linear, scaled between 0-1) into linear depth values
-        
-        intrinsics = compute_intrinsics(cam_width, cam_height, fov)
-
-        return rgb_img, depth_img, intrinsics
-    
+            
     def visualize_camera_pose(self):
         """Visualize the camera's position and orientation using PyBullet's debug lines."""
-        cam_pos, cam_ori = self.get_link_pose(self.cam_link)
+        cam_pos, cam_ori = self.get_link_pose(self.cam_render_link)
 
         # Draw a small sphere at the camera's position
         pybullet.addUserDebugLine(
@@ -454,27 +440,27 @@ class FrankaPandaCam:
         pybullet.addUserDebugLine(
             lineFromXYZ=cam_pos,
             lineToXYZ=cam_pos + cam_forward * 0.2,
-            lineColorRGB=[1, 0, 0],  # Red for Z-axis
+            lineColorRGB=[0, 0, 1],  # Blue for Z-axis
             lineWidth=2
         )
 
-        # # Camera right direction (X-axis)
-        # cam_right = rot_matrix[:, 0]  # X-axis direction
-        # pybullet.addUserDebugLine(
-        #     lineFromXYZ=cam_pos,
-        #     lineToXYZ=cam_pos + cam_right * 0.2,
-        #     lineColorRGB=[0, 0, 1],  # Blue for X-axis
-        #     lineWidth=2
-        # )
+        # Camera right direction (X-axis)
+        cam_right = rot_matrix[:, 0]  # X-axis direction
+        pybullet.addUserDebugLine(
+            lineFromXYZ=cam_pos,
+            lineToXYZ=cam_pos + cam_right * 0.2,
+            lineColorRGB=[1, 0, 0],  # Red for X-axis
+            lineWidth=2
+        )
 
-        # # Camera up direction (Y-axis)
-        # cam_up = rot_matrix[:, 1]  # Y-axis direction
-        # pybullet.addUserDebugLine(
-        #     lineFromXYZ=cam_pos,
-        #     lineToXYZ=cam_pos + cam_up * 0.2,
-        #     lineColorRGB=[0, 1, 0],  # Green for Y-axis
-        #     lineWidth=2
-        # )
+        # Camera up direction (Y-axis)
+        cam_up = rot_matrix[:, 1]  # Y-axis direction
+        pybullet.addUserDebugLine(
+            lineFromXYZ=cam_pos,
+            lineToXYZ=cam_pos + cam_up * 0.2,
+            lineColorRGB=[0, 1, 0],  # Green for Y-axis
+            lineWidth=2
+        )
 
         # Add text for camera position
         pybullet.addUserDebugText(
@@ -548,21 +534,22 @@ class Scene:
     def __init__(
         self,
         sim: p,
-        distance_threshold: float = 0.2, # Collision detection
+        robot_base_pos: np.ndarray = np.array([0.0, 0.0, 0.0]),
+        object_pos: np.ndarray = np.array([0.6, 0.0, 0.0])
+        
     ) -> None:
         self.sim = sim  
-        self.distance_threshold = distance_threshold
+        self.distance_threshold:float = 0.2, # Collision detection
+
+        self.robot_base_pos = robot_base_pos   
+
         self.object_size: np.ndarray = None
-        self.object_pos = np.array([0.6, 0.0, 0.0]) # Default object base position
-        self.obb_min = None
-        self.obb_max = None
+        self.object_pos: np.ndarray = object_pos
+        self.obb_min: np.ndarray = None
+        self.obb_max: np.ndarray = None
         
         # with self.sim.no_rendering():
         self._create_scene()
-        
-        # Load the Franka Panda robot in the scene
-        robot_base_pos = np.array([0.0, 0.0, 0.0]) 
-        self.load_robot(base_position = robot_base_pos)
 
     def load_robot(self, base_position: np.ndarray) -> None:
         """Load the Franka Panda robot into the scene."""
@@ -573,14 +560,19 @@ class Scene:
         """Create the scene with a plane and objects."""
         self.sim.create_plane(z_offset=-0.4)
         self.sim.create_table(length=3, width=3, height=0.4, x_offset=0.3, lateral_friction=1, spinning_friction=1)
-
+        # self.sim.create_box(body_name="robot_stand", half_extents=np.array([0.2, 0.2, self.robot_base_pos[2]/2]), mass=1.0, position=np.array([0.0, 0.0, 0.0]), lateral_friction=1, spinning_friction=1)
+        
+        # Load the Franka Panda robot in the scene
+        self.load_robot(base_position = self.robot_base_pos)
+        
     def import_object(
             self, 
             mesh_name: str,
             mesh_file: Optional[str] = "model.urdf", 
             base_position: Optional[Tuple[float, float, float]] = None, 
             base_orientation: Optional[Tuple[float, float, float, float]] = None, 
-            use_fixed_base: bool = False
+            use_fixed_base: bool = False,
+            scale: Tuple[float, float, float] = (1.0, 1.0, 1.0)
             ) -> int:
         """
         Import a object mesh into the scene.
@@ -591,6 +583,7 @@ class Scene:
             base_position (Tuple[float, float, float], Optional): The position where the object will be placed. Defaults to (0, 0, 0).
             base_orientation (Tuple[float, float, float, float], Optional): The orientation of the object as a quaternion (x, y, z, w). Defaults to (0, 0, 0, 1).
             use_fixed_base (bool): If True, the object will have a fixed base and won't move.
+            scale (Tuple[float, float, float]): Scaling factors for the object along x, y, and z axes.
 
         Returns:
             int: The unique ID of the imported object in the simulation.
@@ -601,7 +594,7 @@ class Scene:
         )
 
         # Default position and orientation
-        base_position = base_position if base_position is not None else (0, 0, 0)
+        base_position = base_position if base_position is not None else self.object_pos
         base_orientation = base_orientation if base_orientation is not None else (0, 0, 0, 1)
         
         # Determine the file type and load accordingly
@@ -614,15 +607,17 @@ class Scene:
                 mesh_path, 
                 basePosition=base_position, 
                 baseOrientation=base_orientation, 
-                useFixedBase=use_fixed_base)
+                useFixedBase=use_fixed_base,
+                globalScaling=scale[0]  # PyBullet's URDF loader only supports uniform scaling
+                )
             
         elif file_ext in [".obj", ".stl"]:
             # Ensure the correct path is being used
             mesh_path = os.path.join(os.path.dirname(__file__), "../assets/ycb_objects", mesh_name, mesh_file)
             # Create the collision shape and return its index
-            collision_id = pybullet.createCollisionShape(pybullet.GEOM_MESH, fileName=mesh_path)
+            collision_id = pybullet.createCollisionShape(pybullet.GEOM_MESH, fileName=mesh_path, mesh_scale = scale)
             # Create the visual shape and return its index
-            visual_id = pybullet.createVisualShape(pybullet.GEOM_MESH, fileName=mesh_path)
+            visual_id = pybullet.createVisualShape(pybullet.GEOM_MESH, fileName=mesh_path, mesh_scale = scale)
             # Create the multi-body using positional arguments for shape indices
             object_id = pybullet.createMultiBody(1.0, collision_id, visual_id, basePosition=base_position, baseOrientation=base_orientation)
         
@@ -677,7 +672,7 @@ class Scene:
         dimensions = obb_max - obb_min
         self.object_size = dimensions
         self.obb_min, self.obb_max = obb_min, obb_max
-        
+                
         return object_id
 
             

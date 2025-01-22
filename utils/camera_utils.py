@@ -2,10 +2,63 @@ from typing import List, Tuple, Optional
 import os
 import numpy as np
 import open3d as o3d
-import copy
+from env.franka_env import FrankaPandaCam
+
+def render_from_robot_cam(
+    robot: FrankaPandaCam,
+    img_width: int = 512,
+    img_height: int = 512,
+    fov: float = 58, # FOV in degrees
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Render images from D405 Camera fixed to the panda robot arm
+    """
+    import pybullet
+    cam_pos = robot.sim.get_link_position("panda_cam", robot.cam_render_link) # Eye position
+    cam_rot = robot.sim.get_link_orientation("panda_cam", robot.cam_render_link) # In quaternion
+    
+    # Compute rotation matrix to transform in world coordinates
+    rot_matrix = np.array(robot.sim.physics_client.getMatrixFromQuaternion(cam_rot)).reshape(3,3) # 3x3 rotation matrix (right, forward, up by columns)
+    forward_vec = rot_matrix.dot(np.array((0, 0, -1))) # (0, 0, -1) is the default forward direction in camera frame, look-at direction
+    up_vec = rot_matrix.dot(np.array((0, 1, 0))) # (0, 1, 0) is the default up direction in camera frame, up direction
+    
+    target_position = cam_pos + 0.1 * forward_vec # Target 0.1 units in front of camera
+    
+    pybullet.configureDebugVisualizer(pybullet.COV_ENABLE_GUI, 1)
+    
+    # Compute view and projection matrices
+    view_matrix = robot.sim.physics_client.computeViewMatrix(cam_pos, target_position, up_vec) # Transform the world coord into camera coord space
+    aspect_ratio = img_width / img_height
+    nearVal, farVal = 0.01, 1.5 # Near, far clipping plane
+    proj_matrix = robot.sim.physics_client.computeProjectionMatrixFOV(fov, aspect_ratio, nearVal, farVal) # Transforms 3D points from camera coord space into 2D screen space
+    
+    # Get RBG and depth images from camera
+    images = robot.sim.physics_client.getCameraImage(
+        img_width, 
+        img_height, 
+        view_matrix, 
+        proj_matrix, 
+        renderer = pybullet.ER_BULLET_HARDWARE_OPENGL
+        )
+    
+    rgb_img = np.array(images[2]).reshape((img_height, img_width, 4))[:, :, :3]
+    
+    depth_img = np.array(images[3]).reshape((img_height, img_width))        
+
+    # Normalize deapth values
+    """
+    The depth data from the simulation is captured in a non-linear way (as a depth buffer). 
+    This needs to be converted into actual depth values using the camera's near and far clipping planes.
+    """
+    depth_img = (-farVal * nearVal / (farVal - (farVal - nearVal) * depth_img)) # Convert raw depth buffer values (non-linear, scaled between 0-1) into linear depth values
+    
+    intrinsics = compute_intrinsics_matrix(img_width, img_height, fov)
+
+    return rgb_img, depth_img, intrinsics
 
 def compute_intrinsics_matrix(
-    image_width: int, 
+    image_width: int,
+    image_height: int, 
     fov: float
     ) -> np.ndarray:
     """
@@ -13,13 +66,16 @@ def compute_intrinsics_matrix(
 
     Args:
         image_width (int): Width of the image (in pixels).
+        image_height (int): Height of the image (in pixels).
         fov (float): Field of view (in degrees) of the camera.
 
     Returns:
         np.ndarray: 3x3 intrinsic matrix.
     """
-    fx = fy = image_width / (2 * np.tan(fov * np.pi / 180 / 2))  # Focal lengths
-    cx = cy = image_width / 2  # Principal point (center of the image)
+    fx = image_width / (2 * np.tan(fov * np.pi / 360))  # Focal lengths
+    fy = image_height / (2 * np.tan(fov * np.pi / 360))
+    cx = image_width / 2  # Principal point x-coordinate
+    cy = image_height / 2  # Principal point y-coordinate
 
     # Intrinsic matrix
     intrinsics = np.array([[fx, 0, cx],
@@ -29,33 +85,24 @@ def compute_intrinsics_matrix(
     return intrinsics
 
 def compute_extrinsics_matrix(
-    Rx: np.ndarray, 
-    Ry: np.ndarray, 
-    Rz: np.ndarray, 
-    camera_position: np.ndarray
-) -> np.ndarray:
+    R: np.ndarray,
+    t: np.ndarray
+    ) -> np.ndarray:
     """
-    Computes the extrinsic matrix, which maps points from the world frame to the camera frame.
+    Computes the extrinsic matrix, which maps points from the camera frame to the world frame.
 
     Args:
-        Rx (np.ndarray): Rotation vector along the X-axis (3x1).
-        Ry (np.ndarray): Rotation vector along the Y-axis (3x1).
-        Rz (np.ndarray): Rotation vector along the Z-axis (3x1).
-        camera_position (np.ndarray): Camera position in world coordinates (3x1).
+        R (np.ndarray): Camera orientation in world coordinates (3x3).
+        t (np.ndarray): Camera position in world coordinates (3x1).
 
     Returns:
         np.ndarray: 4x4 extrinsic matrix.
     """
     extrinsics = np.eye(4)  # Create a 4x4 identity matrix
-
-    # Assign rotation vectors
-    extrinsics[:3, 0] = Rx
-    extrinsics[:3, 1] = Ry
-    extrinsics[:3, 2] = Rz
-
-    # Assign translation (camera center in world coordinates)
-    extrinsics[:3, 3] = camera_position
-
+    
+    extrinsics[:3, :3] = R
+    extrinsics[:3, 3] = t
+    
     return extrinsics
 
 def depth_to_camera_frame(
@@ -77,11 +124,11 @@ def depth_to_camera_frame(
     fx, fy = intrinsics[0, 0], intrinsics[1, 1]
 
     # Create arrays of pixel coordinates
-    i, j = np.indices((height, width))
+    x, y = np.indices((height, width))
 
     # Compute 3D coordinates in the camera frame
-    x_cam = (j - cx) * depth_image / fx
-    y_cam = (i - cy) * depth_image / fy
+    x_cam = (y - cx) * depth_image / fx
+    y_cam = (x - cy) * depth_image / fy
     z_cam = depth_image  # z_cam is the depth value
 
     # Stack into 3D point vectors
@@ -90,7 +137,7 @@ def depth_to_camera_frame(
     return points_camera_frame
 
 def camera_to_world(
-    points_camera_frame: np.ndarray, 
+    points_camera: np.ndarray, 
     extrinsics: np.ndarray
     ) -> np.ndarray:
     """
@@ -105,25 +152,27 @@ def camera_to_world(
     """
     # Add homogeneous coordinate (1) to each point for matrix multiplication
     points_homogeneous = np.concatenate(
-        [points_camera_frame, np.ones((*points_camera_frame.shape[:2], 1))], axis=-1
+        [points_camera, np.ones((*points_camera.shape[:2], 1))], axis=-1
     )
 
     # Reshape to (N, 4) for matrix multiplication
     points_homogeneous = points_homogeneous.reshape(-1, 4)
 
     # Apply the extrinsic matrix to each point
-    points_world_frame = (extrinsics @ points_homogeneous.T).T
-
+    points_world = (extrinsics @ points_homogeneous.T).T
+    
     # Remove homogeneous coordinate
-    points_world_frame = points_world_frame[:, :3]
-
-    return points_world_frame.reshape(*points_camera_frame.shape)
+    points_world = points_world[:, :3]
+    
+    return points_world.reshape(*points_camera.shape)
 
 
 def depth_image_to_point_cloud(
     depth_image: np.ndarray, 
     intrinsics: np.ndarray, 
-    extrinsics: np.ndarray
+    extrinsics: np.ndarray,
+    object_center,
+    object_rotation
     ) -> np.ndarray:
     """
     Converts a depth image into a 3D point cloud in the world frame.
@@ -143,9 +192,13 @@ def depth_image_to_point_cloud(
     points_world_frame = camera_to_world(points_camera_frame, extrinsics) # (H,W,3)
 
     # Flatten the point cloud to shape (N, 3)
-    point_cloud = points_world_frame.reshape(-1, 3) # (N, 3)
+    points_world_reshaped = points_world_frame.reshape(-1, 3) # (N, 3)
+    
+    # translated_points = points_world_reshaped - object_center
+    # rotated_points = translated_points @ object_rotation
+    # pcd_array = rotated_points + object_center
 
-    return point_cloud
+    return points_world_reshaped
 
 
 def plot_point_cloud(file_name: str) -> None:
