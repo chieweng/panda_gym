@@ -368,10 +368,6 @@ if __name__ == "__main__":
         # logger.info('              snap mismatched borders')
             #ms.meshing_snap_mismatched_borders()
 
-
-
-
-
         if args.holefill.upper() == "TRUE":
             
             logger.info('              closing holes')
