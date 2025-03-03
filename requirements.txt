@@ -1,0 +1,6 @@
+matplotlib==3.8.0
+numpy==1.26
+open3d==0.18.0
+pybullet==3.2.6
+pymeshlab==2023.12.post1
+scipy==1.11.4
