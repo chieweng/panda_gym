@@ -2,7 +2,7 @@ from typing import List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor
 import os
 import numpy as np
-import open3d as o3d
+import  open3d as o3d
 import copy
 
 import logging
@@ -13,7 +13,6 @@ class PointCloudMerger:
     Point cloud alignment process:
     1. Global Registration (RANSAC-based): Obtain rough initial alignment of the point clouds, performed on heavily downsampled pcd
     2. Local Registration (ICP): Using the rough alignment from the global registration, apply ICP to finetune the alignment on original pcd
-    3. Tesselation using rolling-ball + Laplacian surface smoothing (for mesh generation)
     """
     
     def __init__(
@@ -50,11 +49,25 @@ class PointCloudMerger:
         self.generate_mesh = generate_mesh
         self.npy_file_path = os.path.join(os.path.dirname(__file__), '..', 'scans')
         self.source_pcd_list: List[o3d.geometry.PointCloud] = []
-        self.source_down_list: List[o3d.geometry.PointCloud] = [] # List of downsampled source pcd with normal
-        self.source_fpfh_list: List[o3d.registration.Feature] = [] # List of FPFH descriptor (N, 33) for each pcd, where N = num of points in pcd, 33 = num of bins of the histogram in standard configuration
-        self.target_pcd = o3d.geometry.PointCloud() # Initialize empty o3d for final pcd output
     
     def downsample_and_compute_fpfh(self, pcd):
+        """
+        Downsamples a given point cloud to a target size range and computes its Fast Point Feature Histogram (FPFH).
+
+        Steps:
+        1. Downsample the input point cloud using voxel downsampling, adjusting voxel size iteratively 
+        to ensure the point count remains within the specified range.
+        2. Estimate normals for the downsampled point cloud.
+        3. Compute the FPFH feature, which encodes local geometric properties of each point 
+        based on the distribution of angles between its normal and the normals of its neighbors.
+
+        Args:
+        - pcd (o3d.geometry.PointCloud): The input point cloud to be processed.
+
+        Returns:
+        - pcd_down (o3d.geometry.PointCloud): The downsampled point cloud.
+        - fpfh (o3d.pipelines.registration.Feature): The computed FPFH feature for the downsampled point cloud.
+        """
         def downsample_to_target(pcd, target_min=2500, target_max=3500, max_iter=50):
             """
             Downsample the point cloud to a size within the target range [target_min, target_max].
@@ -96,8 +109,21 @@ class PointCloudMerger:
             )
         return pcd_down, fpfh
 
-    def pcd_preprocessing(self):    
-        files = [f for f in os.listdir(self.npy_file_path) if f.endswith('.npy')] # List all npy files in dir
+    def pcd_preprocessing(self): 
+        """
+        Loads and preprocesses all .npy point cloud files in the specified directory ("../scans/")
+
+        Steps:
+        1. Loads and converts .npy files into Open3D point clouds.
+        2. Removes background points (wall/ floor/ clipping plane) by cropping the point cloud using an enlarged bounding box.
+        3. Segments and removes the largest planar surface (e.g., a table) using RANSAC. This step is to ensure that all noise are filtered and removed.
+        4. Downsamples the filtered point cloud and compute FPFH features.
+        5. Stores the processed point clouds and FPFH features in respective lists.
+
+        Modifies:
+        - self.source_pcd_list (list): Stores the cropped and filtered point clouds.
+        """   
+        files = sorted(f for f in os.listdir(self.npy_file_path) if f.endswith('.npy')) # List all npy files in dir
         if not files: raise ValueError("No .npy files found in the specified directory.")
         
         npy_data_list = [np.load(os.path.join(self.npy_file_path, file)) for file in files] # Load each npy file into list
@@ -140,10 +166,6 @@ class PointCloudMerger:
             
             # Populate
             self.source_pcd_list.append(pcd_masked)
-            self.source_down_list.append(pcd_down)
-            self.source_fpfh_list.append(fpfh)
-            
-        self.target_pcd = self.source_pcd_list[0]
     
     def global_registration(self, source_down, target_down, source_fpfh, target_fpfh):
         """ 
@@ -163,9 +185,9 @@ class PointCloudMerger:
         Note: 
             o3d.pipelines.registration.TransformationEstimationPointToPoint(False) is set to False, as it only uses point positions
             to estimate the transformation, the algorithm will perform point-to-point matching without using the point normals: 
-                1) Downsampled pcd will have lower resolution of normal data, complex surfaces and geometry details will also not benefit 
+                1) Downsampled pcd have lower resolution of normal data (fewer points), hence complex surfaces and geometry details will not benefit 
                 from the limited normal information.
-                2) Computational efficiency for rough transformation using global registration, ICP for refined alignments.
+                2) Improved computational efficiency for rough initial transformation using global registration, ICP will later be used for refined alignments.
         """
         
         result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
@@ -176,7 +198,7 @@ class PointCloudMerger:
             ransac_n = 3, 
             checkers = [o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.95),
                         o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(self.max_correspondence_dist)], 
-            criteria = o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 20000))
+            criteria = o3d.pipelines.registration.RANSACConvergenceCriteria(500000, 50000))
         
         logging.info(f"RANSAC result: fitness = {result.fitness}, inlier_rmse = {result.inlier_rmse}")
         
@@ -231,12 +253,12 @@ class PointCloudMerger:
             transformation_matrix_ICP = self.point_to_plane_icp(source_pcd, target_pcd, transformation_matrix_RANSAC)
             # logging.info("ICP registration completed")
 
-            # Transform and merge source cloud
+            # Transform and merge source clouds
             source_pcd.transform(transformation_matrix_ICP)
             target_pcd += source_pcd        
             target_pcd.remove_duplicated_points()
             # logging.info("Pairwise merge completed")
-            
+                    
             return target_pcd
         
         current_layer = pcd_list
@@ -278,13 +300,11 @@ class PointCloudMerger:
     
     def save_results(self, point_cloud: Optional[o3d.geometry.PointCloud], mesh: Optional[o3d.geometry.TriangleMesh]):
         """
-        Save the merged point cloud and mesh to files.
+        Save the merged point cloud/mesh to files.
 
         Args:
             point_cloud (Optional, o3d.geometry.PointCloud): The merged point cloud.
             mesh (Optional, o3d.geometry.TriangleMesh): The smoothed mesh.
-            pcd_filename (str): Filename to save the point cloud.
-            mesh_filename (str): Filename to save the mesh.
         """
         output_dir = os.path.join(os.path.dirname(__file__), '..', 'scans')
 

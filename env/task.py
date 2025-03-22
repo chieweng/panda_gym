@@ -9,6 +9,7 @@ from pyb_class import PyBullet as p
 from env.franka_env import FrankaPandaCam, Scene
 from utils.camera_utils import *
 from utils.pcd_utils import *
+from utils.os_utils import *
 
 import logging
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -57,6 +58,8 @@ class MultiScanTask(Task):
             scene (Scene): The simulation scene containing the object.
         """
         
+        backup_and_clean(self.output_dir)
+        
         object_base_pos, object_center_height = scene.object_pos, scene.object_size[2]/2 # Get default object base position and object CoG height from scene
         object_center = object_base_pos + [0, 0, object_center_height]
 
@@ -97,7 +100,7 @@ class MultiScanTask(Task):
             
             # Convert depth image to point cloud in world frame
             point_cloud = depth_image_to_point_cloud(depth_img, intrinsics, extrinsics, object_center, cam_ori_R)
-            
+
             np.save(os.path.join(self.output_dir, f"point_cloud_{i+1:03d}.npy"), point_cloud)
             logging.info(f"Point Cloud saved for scan {i+1}.")
             
@@ -184,4 +187,3 @@ class MultiScanTask(Task):
         """Close the robot simulation after completing the scanning task."""
         logging.info("Closing the robot simulation...")
         self.robot.close()
-
