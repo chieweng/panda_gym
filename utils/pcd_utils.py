@@ -50,7 +50,7 @@ class PointCloudMerger:
         self.npy_file_path = os.path.join(os.path.dirname(__file__), '..', 'scans')
         self.source_pcd_list: List[o3d.geometry.PointCloud] = []
     
-    def downsample_and_compute_fpfh(self, pcd):
+    def downsample_and_compute_fpfh(self, pcd: o3d.geometry.PointCloud, target_min=2500, target_max=3500, max_iter=50) -> Tuple[o3d.geometry.PointCloud, o3d.pipelines.registration.Feature]:
         """
         Downsamples a given point cloud to a target size range and computes its Fast Point Feature Histogram (FPFH).
 
@@ -68,7 +68,24 @@ class PointCloudMerger:
         - pcd_down (o3d.geometry.PointCloud): The downsampled point cloud.
         - fpfh (o3d.pipelines.registration.Feature): The computed FPFH feature for the downsampled point cloud.
         """
-        def downsample_to_target(pcd, target_min=2500, target_max=3500, max_iter=50):
+        
+        pcd_down = self.downsample_to_target(pcd, target_min, target_max, max_iter)
+
+        # Estimate normals for downsampled pcd
+        radius_normal = self.voxel_size * 2
+        pcd_down.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius = radius_normal, max_nn = 30)
+            )
+        
+        # Compute FPFH, which captures local geom properties of each point based on distribution of angles between the point's normal and neighbors' normals.
+        radius_feature = self.voxel_size * 2
+        fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+            pcd_down, 
+            o3d.geometry.KDTreeSearchParamHybrid(radius = radius_feature, max_nn = 175)
+            )
+        return pcd_down, fpfh
+    
+    def downsample_to_target(self, pcd: o3d.geometry.PointCloud, target_min, target_max, max_iter) -> o3d.geometry.PointCloud:
             """
             Downsample the point cloud to a size within the target range [target_min, target_max].
             """
@@ -92,22 +109,6 @@ class PointCloudMerger:
                 downsampled_pcd = pcd.voxel_down_sample(voxel_size)
             
             return downsampled_pcd
-        
-        pcd_down = downsample_to_target(pcd)
-
-        # Estimate normals for downsampled pcd
-        radius_normal = self.voxel_size * 2
-        pcd_down.estimate_normals(
-            o3d.geometry.KDTreeSearchParamHybrid(radius = radius_normal, max_nn = 30)
-            )
-        
-        # Compute FPFH, which captures local geom properties of each point based on distribution of angles between the point's normal and neighbors' normals.
-        radius_feature = self.voxel_size * 2
-        fpfh = o3d.pipelines.registration.compute_fpfh_feature(
-            pcd_down, 
-            o3d.geometry.KDTreeSearchParamHybrid(radius = radius_feature, max_nn = 175)
-            )
-        return pcd_down, fpfh
 
     def pcd_preprocessing(self): 
         """
@@ -296,11 +297,56 @@ class PointCloudMerger:
         self.visualize(merged_pcd)
         
         return merged_pcd
-    
-    
+
+    def generate_mesh_from_pcd(self, point_cloud: o3d.geometry.PointCloud) -> o3d.geometry.TriangleMesh:
+        """
+        Generate a mesh from the given point cloud using Poisson surface reconstruction.
+
+        Args:
+            point_cloud (o3d.geometry.PointCloud): The input point cloud.
+s
+        Returns:
+            o3d.geometry.TriangleMesh: The generated mesh.
+        """
+        pcd_down = self.downsample_to_target(point_cloud, target_min=10000, target_max=20000, max_iter=50)
+
+        # Estimate normals
+        if not pcd_down.has_normals():
+            pcd_down.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=self.voxel_size * 2, max_nn=30))
+            pcd_down.orient_normals_consistent_tangent_plane(50)
+            
+        import traceback
+        import time
+        try:
+            logging.info(f"Generating mesh... total points: {len(pcd_down.points)}")
+            start_time = time.time()
+            mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd_down, depth=10)
+            end_time = time.time()
+            logging.info(f"Poisson reconstruction took {end_time - start_time:.2f} seconds")
+        except Exception as e:
+            logging.error("Mesh generation failed:")
+            traceback.print_exc()
+
+        # Crop mesh based on density to remove low density vertices
+        densities = np.asarray(densities)
+        density_threshold = np.quantile(densities, 0.01)
+        vertices_to_keep = densities > density_threshold
+        mesh = mesh.select_by_index(np.where(vertices_to_keep)[0])
+        
+        # Smoothing
+        for _ in range(self.smoothing_iter):
+            mesh = mesh.filter_smooth_simple(number_of_iterations=1)
+        
+        mesh.compute_vertex_normals()
+        logging.info(f"Mesh stats: {len(mesh.vertices)} vertices, {len(mesh.triangles)} triangles")
+
+        self.visualize(mesh = mesh)
+        
+        return mesh
+
     def save_results(self, point_cloud: Optional[o3d.geometry.PointCloud], mesh: Optional[o3d.geometry.TriangleMesh]):
         """
-        Save the merged point cloud/mesh to files.
+        Save the merged point cloud/mesh.
 
         Args:
             point_cloud (Optional, o3d.geometry.PointCloud): The merged point cloud.
@@ -380,4 +426,3 @@ class PointCloudMerger:
 
         for edge in edges:
             p.addUserDebugLine(corners[edge[0]], corners[edge[1]], [1, 0, 0], lineWidth=2)
-            
