@@ -1,0 +1,13 @@
+panda_gym/__pycache__/
+panda_gym/scans/
+panda_gym/assets/
+
+cornell_grasp_dataset/
+graspnet/
+gpd/
+jacquard_dataset/
+
+
+.venv/
+__pycache__/
+*.pyc
