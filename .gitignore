@@ -7,7 +7,6 @@ graspnet/
 gpd/
 jacquard_dataset/
 
-
 .venv/
 __pycache__/
 *.pyc
